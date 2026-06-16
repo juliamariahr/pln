@@ -15,6 +15,7 @@ REQUEST_VERBS = {
     "solicitar",
     "requisitar",
     "requerer",
+    "querer",
     "ordenar",
     "mandar",
     "determinar",
@@ -52,6 +53,18 @@ ACTION_DEPS_FALLBACK = {
     "acl",
 }
 
+REQUEST_IMPERATIVE_MARKERS = {
+    "vamos",
+    "vamo",
+}
+
+COMMON_FIXES = {
+    "sera": "será",
+    "voce": "você",
+    "esta": "está",
+    "ate": "até",
+}
+
 MARKUP_TAG_RE = re.compile(r"<[^>]+>")
 WHITESPACE_RE = re.compile(r"\s+")
 
@@ -76,8 +89,14 @@ def load_nlp() -> "spacy.language.Language":
 
 def preprocess_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text)
+
+    words = normalized.split()
+    words = [COMMON_FIXES.get(w.lower(), w) for w in words]
+    normalized = " ".join(words)
+
     normalized = MARKUP_TAG_RE.sub(" ", normalized)
     normalized = normalized.replace("\u00a0", " ")
+
     return WHITESPACE_RE.sub(" ", normalized).strip()
 
 
@@ -105,28 +124,123 @@ def has_case_preposition(token: Token, allowed: Iterable[str]) -> bool:
     return False
 
 
+def is_imperative_request(token: Token) -> bool:
+    moods = {mood.lower() for mood in token.morph.get("Mood")}
+
+    if "imp" in moods:
+        return True
+
+    if (
+        token.dep_ == "ROOT"
+        and token.pos_ == "VERB"
+        and token.i == token.sent.start
+    ):
+        return True
+
+    return (
+        token.lemma_.lower() == "ir"
+        and token.text.lower() in REQUEST_IMPERATIVE_MARKERS
+    )
+
+
+def looks_like_surface_command(token: Token) -> bool:
+    sent = token.sent
+    if token.i != sent.start:
+        return False
+
+    if any(item.pos_ in {"VERB", "AUX"} for item in sent):
+        return False
+
+    content_tokens = [item for item in sent if not item.is_punct and not item.is_space]
+    if len(content_tokens) < 2:
+        return False
+
+    if not token.is_alpha:
+        return False
+
+    next_token = content_tokens[1]
+    return next_token.pos_ in {"DET", "NOUN", "PROPN", "ADJ", "PRON", "NUM"} or next_token.dep_ == "det"
+
+
 def extract_requester(verb: Token) -> Optional[str]:
+    if looks_like_surface_command(verb):
+        return "você (implícito)"
+
     for anchor in (verb, verb.head):
         if anchor == verb or verb.dep_ == "xcomp":
             for child in anchor.children:
-                if child.dep_ == "obl:agent" and has_case_preposition(child, {"por", "pela", "pelo", "pelas", "pelos"}):
-                    return token_span_text_without_case(child, {"por", "pela", "pelo", "pelas", "pelos"})
+                if child.dep_ == "obl:agent" and has_case_preposition(
+                    child, {"por", "pela", "pelo", "pelas", "pelos"}
+                ):
+                    return token_span_text_without_case(
+                        child, {"por", "pela", "pelo", "pelas", "pelos"}
+                    )
 
             for child in anchor.children:
-                if child.dep_ == "obl" and has_case_preposition(child, {"por", "pela", "pelo", "pelas", "pelos"}):
-                    return token_span_text_without_case(child, {"por", "pela", "pelo", "pelas", "pelos"})
+                if child.dep_ == "obl" and has_case_preposition(
+                    child, {"por", "pela", "pelo", "pelas", "pelos"}
+                ):
+                    return token_span_text_without_case(
+                        child, {"por", "pela", "pelo", "pelas", "pelos"}
+                    )
 
             for child in anchor.children:
                 if child.dep_ in SUBJECT_DEPS:
                     return token_span_text(child)
 
+    for token in verb.sent:
+        if token.pos_ in {"VERB", "AUX"}:
+            for child in token.children:
+                if child.dep_ in SUBJECT_DEPS:
+                    return token_span_text(child)
+
+    for token in verb.sent:
+        if token.dep_ in SUBJECT_DEPS:
+            return token_span_text(token)
+
+    persons = {person.lower() for person in verb.morph.get("Person")}
+    numbers = {number.lower() for number in verb.morph.get("Number")}
+
+    if "1" in persons and "sing" in numbers:
+        return "eu (implícito)"
+
+    if "1" in persons and "plur" in numbers:
+        return "nós (implícito)"
+
+    if is_imperative_request(verb):
+        return "você (implícito)"
+
+    if (
+        verb.lemma_.lower() == "ir"
+        and verb.text.lower() in REQUEST_IMPERATIVE_MARKERS
+    ):
+        return "nós (implícito)"
+
     return None
 
 
 def extract_action(verb: Token) -> Optional[str]:
+    if looks_like_surface_command(verb):
+        remainder = verb.doc[verb.i + 1 : verb.sent.end].text.strip().rstrip(".,;:!?")
+        if remainder:
+            return remainder
+        return token_span_text(verb)
+
+    if verb.lemma_.lower() == "ir" and verb.text.lower() in REQUEST_IMPERATIVE_MARKERS:
+        remainder = verb.doc[verb.i + 1 : verb.sent.end].text.strip().rstrip(".,;:!?")
+        if remainder:
+            return remainder
+        return token_span_text(verb)
+
     for child in verb.children:
         if child.dep_ in ACTION_DEPS:
             return token_span_text(child)
+
+    if is_imperative_request(verb):
+        remainder = verb.doc[verb.i + 1 : verb.sent.end].text.strip()
+        if remainder:
+            return remainder
+        return verb.lemma_
 
     for child in verb.children:
         if child.dep_ in ACTION_DEPS_FALLBACK:
@@ -144,8 +258,40 @@ def find_request_verb(sent: Span) -> Optional[Token]:
         if token.pos_ in {"VERB", "AUX"} and token.lemma_.lower() in REQUEST_TRIGGER_LEMMAS:
             return token
 
+        if token.pos_ in {"VERB", "AUX"} and is_imperative_request(token):
+            return token
+
+    first_token = sent[0]
+    if looks_like_surface_command(first_token):
+        return first_token
+
+    # procura primeiro VERB raiz
+    for token in sent:
+        if token.dep_ == "ROOT" and token.pos_ == "VERB":
+            return token
+
+    # depois AUX raiz
+    for token in sent:
+        if token.dep_ == "ROOT" and token.pos_ == "AUX":
+            return token
+
+    # depois qualquer VERB
+    for token in sent:
+        if token.pos_ == "VERB":
+            return token
+
+    # por último AUX
+    for token in sent:
+        if token.pos_ == "AUX":
+            return token
+
     return None
 
+def get_verb_phrase(token):
+    aux = [c for c in token.children if c.pos_ == "AUX"]
+    if aux:
+        return f"{aux[0].text} {token.text}"
+    return token.text
 
 def build_study_report(original_text: str, doc: Doc) -> str:
     lines = [
